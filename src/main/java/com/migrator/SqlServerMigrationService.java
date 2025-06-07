@@ -11,10 +11,10 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.sql.*;
+import java.sql.Date;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.Date;
 
 @Service
 public class SqlServerMigrationService {
@@ -519,7 +519,7 @@ public class SqlServerMigrationService {
                 "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc " +
                 "INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE c ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME " +
                 "WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY' " +
-                "ORDER BY c.TABLE_SCHEMA";
+                "ORDER BY c.ORDINAL_POSITION";
 
         PreparedStatement pstmt = null;
         ResultSet rs = null;
@@ -688,20 +688,56 @@ public class SqlServerMigrationService {
                     for (int i = 1; i <= columnCount; i++) {
                         String columnName = rsmd.getColumnLabel(i);
                         Object value = rs.getObject(i);
+                        int columnType = rsmd.getColumnType(i);
 
-                        // Convertir tipos especiales para JSON
-                        if (value instanceof byte[]) {
-                            // Convertir VARBINARY a Base64
-                            value = Base64.getEncoder().encodeToString((byte[]) value);
+                        // Convertir tipos especiales para JSON con metadatos de tipo
+                        if (value == null) {
+                            row.put(columnName, null);
+                        } else if (value instanceof byte[]) {
+                            // VARBINARY, BINARY, IMAGE - convertir a Base64 con marcador
+                            Map<String, Object> binaryData = new HashMap<String, Object>();
+                            binaryData.put("_type", "VARBINARY");
+                            binaryData.put("_value", Base64.getEncoder().encodeToString((byte[]) value));
+                            row.put(columnName, binaryData);
                         } else if (value instanceof Timestamp) {
-                            value = value.toString();
+                            Map<String, Object> timestampData = new HashMap<String, Object>();
+                            timestampData.put("_type", "TIMESTAMP");
+                            timestampData.put("_value", value.toString());
+                            row.put(columnName, timestampData);
                         } else if (value instanceof Time) {
-                            value = value.toString();
+                            Map<String, Object> timeData = new HashMap<String, Object>();
+                            timeData.put("_type", "TIME");
+                            timeData.put("_value", value.toString());
+                            row.put(columnName, timeData);
                         } else if (value instanceof Date) {
-                            value = value.toString();
+                            Map<String, Object> dateData = new HashMap<String, Object>();
+                            dateData.put("_type", "DATE");
+                            dateData.put("_value", value.toString());
+                            row.put(columnName, dateData);
+                        } else if (columnType == java.sql.Types.LONGVARCHAR || columnType == java.sql.Types.LONGNVARCHAR) {
+                            // TEXT, NTEXT
+                            Map<String, Object> textData = new HashMap<String, Object>();
+                            textData.put("_type", "TEXT");
+                            textData.put("_value", value.toString());
+                            row.put(columnName, textData);
+                        } else if (value instanceof java.sql.Clob) {
+                            // CLOB data
+                            java.sql.Clob clob = (java.sql.Clob) value;
+                            Map<String, Object> clobData = new HashMap<String, Object>();
+                            clobData.put("_type", "CLOB");
+                            clobData.put("_value", clob.getSubString(1, (int) clob.length()));
+                            row.put(columnName, clobData);
+                        } else if (value instanceof java.sql.Blob) {
+                            // BLOB data
+                            java.sql.Blob blob = (java.sql.Blob) value;
+                            Map<String, Object> blobData = new HashMap<String, Object>();
+                            blobData.put("_type", "BLOB");
+                            blobData.put("_value", Base64.getEncoder().encodeToString(blob.getBytes(1, (int) blob.length())));
+                            row.put(columnName, blobData);
+                        } else {
+                            // Tipos normales (VARCHAR, INT, etc.)
+                            row.put(columnName, value);
                         }
-
-                        row.put(columnName, value);
                     }
                     tableData.add(row);
                 }
@@ -1031,22 +1067,21 @@ public class SqlServerMigrationService {
 
             pstmt = connection.prepareStatement(insertSql);
 
+            // Obtener información de tipos de columnas para conversión correcta
+            Map<String, String> columnTypes = getColumnTypes(connection, tableInfo);
+
             int count = 0;
 
             for (Map<String, Object> row : tableData) {
                 for (int i = 0; i < columns.size(); i++) {
-                    Object value = row.get(columns.get(i));
+                    String columnName = columns.get(i);
+                    Object value = row.get(columnName);
+                    String columnType = columnTypes.get(columnName);
 
-                    // Reconvertir tipos especiales
-                    if (value instanceof String && isBase64Encoded((String) value)) {
-                        try {
-                            value = Base64.getDecoder().decode((String) value);
-                        } catch (IllegalArgumentException e) {
-                            // No es Base64, mantener como string
-                        }
-                    }
+                    // Convertir valores según el tipo de columna de destino
+                    Object convertedValue = convertValueForColumn(value, columnType);
 
-                    pstmt.setObject(i + 1, value);
+                    pstmt.setObject(i + 1, convertedValue);
                 }
                 pstmt.addBatch();
                 count++;
@@ -1070,6 +1105,113 @@ public class SqlServerMigrationService {
             if (pstmt != null) pstmt.close();
             if (stmt != null) stmt.close();
         }
+    }
+
+    private Map<String, String> getColumnTypes(Connection connection, SqlServerExportData.TableInfo tableInfo) {
+        Map<String, String> columnTypes = new HashMap<String, String>();
+
+        for (SqlServerExportData.ColumnInfo column : tableInfo.getColumns()) {
+            columnTypes.put(column.getColumnName(), column.getDataType().toLowerCase());
+        }
+
+        return columnTypes;
+    }
+
+    private Object convertValueForColumn(Object value, String columnType) {
+        if (value == null) {
+            return null;
+        }
+
+        // Si el valor es un Map, significa que tiene metadatos de tipo
+        if (value instanceof Map) {
+            Map<String, Object> valueMap = (Map<String, Object>) value;
+            String storedType = (String) valueMap.get("_type");
+            Object storedValue = valueMap.get("_value");
+
+            if (storedValue == null) {
+                return null;
+            }
+
+            if ("VARBINARY".equals(storedType) || "BLOB".equals(storedType)) {
+                // Reconvertir de Base64 a bytes
+                try {
+                    return Base64.getDecoder().decode((String) storedValue);
+                } catch (IllegalArgumentException e) {
+                    System.err.println("⚠️  Error decodificando Base64, usando valor original");
+                    return storedValue;
+                }
+            } else if ("TIMESTAMP".equals(storedType)) {
+                // Convertir string de vuelta a Timestamp
+                try {
+                    return Timestamp.valueOf((String) storedValue);
+                } catch (IllegalArgumentException e) {
+                    return storedValue;
+                }
+            } else if ("TIME".equals(storedType)) {
+                // Convertir string de vuelta a Time
+                try {
+                    return Time.valueOf((String) storedValue);
+                } catch (IllegalArgumentException e) {
+                    return storedValue;
+                }
+            } else if ("DATE".equals(storedType)) {
+                // Convertir string de vuelta a Date
+                try {
+                    return Date.valueOf((String) storedValue);
+                } catch (IllegalArgumentException e) {
+                    return storedValue;
+                }
+            } else if ("TEXT".equals(storedType) || "CLOB".equals(storedType)) {
+                // Texto largo
+                return storedValue;
+            }
+
+            return storedValue;
+        }
+
+        // Para valores que no tienen metadatos, hacer conversión basada en tipo de columna
+        if (columnType != null) {
+            if (columnType.contains("varbinary") || columnType.contains("binary") || columnType.contains("image")) {
+                // Si esperamos binario pero tenemos string, intentar decodificar Base64
+                if (value instanceof String && isBase64Encoded((String) value)) {
+                    try {
+                        return Base64.getDecoder().decode((String) value);
+                    } catch (IllegalArgumentException e) {
+                        System.err.println("⚠️  Error decodificando Base64 para columna " + columnType);
+                        return value;
+                    }
+                }
+            } else if (columnType.contains("datetime") || columnType.contains("timestamp")) {
+                // Convertir strings a Timestamp
+                if (value instanceof String) {
+                    try {
+                        return Timestamp.valueOf((String) value);
+                    } catch (IllegalArgumentException e) {
+                        return value;
+                    }
+                }
+            } else if (columnType.contains("time") && !columnType.contains("datetime")) {
+                // Convertir strings a Time
+                if (value instanceof String) {
+                    try {
+                        return Time.valueOf((String) value);
+                    } catch (IllegalArgumentException e) {
+                        return value;
+                    }
+                }
+            } else if (columnType.contains("date") && !columnType.contains("datetime")) {
+                // Convertir strings a Date
+                if (value instanceof String) {
+                    try {
+                        return Date.valueOf((String) value);
+                    } catch (IllegalArgumentException e) {
+                        return value;
+                    }
+                }
+            }
+        }
+
+        return value;
     }
 
     private boolean isBase64Encoded(String str) {
